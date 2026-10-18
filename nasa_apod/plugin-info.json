@@ -1,0 +1,18 @@
+{
+  "id": "nasa_apod",
+  "display_name": "NASA Picture of the Day",
+  "class": "NasaApod",
+  "repository": "https://github.com",
+  "settings": [
+    {
+      "name": "fit_mode",
+      "label": "Image Fit Mode",
+      "type": "select",
+      "options": [
+        {"value": "fill", "label": "Fill Screen (Crop to Fit)"},
+        {"value": "fit", "label": "Fit Screen (Letterbox Black Bars)"}
+      ],
+      "default": "fill"
+    }
+  ]
+}
