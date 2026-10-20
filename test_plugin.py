@@ -1,15 +1,18 @@
 # test_plugin.py
+import logging
 import os
 import sys
 
-# 1. Inject the NASA WordPress schema map into nasa_apod.py 
-modern_api_code = '''# nasa_apod/nasa_apod.py
+# 1. Inject the NASA WordPress schema map into nasa_apod.py (now display-size aware)
+modern_api_code = r'''# nasa_apod/nasa_apod.py
+import html
 import io
 import random
 import re
 from datetime import datetime
 import requests
-from urllib.parse import urlparse, parse_qs
+import logging
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from PIL import Image, ImageDraw, ImageFont
 from plugins.base_plugin.base_plugin import BasePlugin
 
@@ -19,6 +22,8 @@ VIDEO_HINTS = re.compile(
     r"\b(featured video|this video|the video|video shows|time-?lapse|animation shows|watch the)\b",
     re.IGNORECASE,
 )
+logger = logging.getLogger(__name__)
+
 FONT_CANDIDATES = [
     "DejaVuSans-Bold.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -76,7 +81,10 @@ class NasaApod(BasePlugin):
             title = raw_title.get("rendered", "NASA APOD")
         else:
             title = str(raw_title)
-        return title.replace("&#8217;", "'").replace("&#8220;", '"').replace("&#8221;", '"')
+        # Decode every HTML entity (&amp; &#8211; &#039; ...), drop stray tags, tidy spaces
+        title = html.unescape(title)
+        title = re.sub(r"<[^>]+>", "", title)
+        return " ".join(title.split()) or "NASA APOD"
 
     def _get_date_text(self, post):
         """Format the post date (YYYY-MM-DD) as e.g. 'Oct 15, 2026'."""
@@ -91,41 +99,70 @@ class NasaApod(BasePlugin):
     def _get_image_url(self, post):
         return post.get("hdurl") or post.get("url")
 
-    def _is_static_image(self, post):
-        """True only for genuine static photos. NASA labels some video days as
-        media_type "image" and supplies a small thumbnail, so check more than that."""
+    def _static_image_reason(self, post):
+        """Return None if the post is a usable static photo, else a short reason why not."""
         img_url = self._get_image_url(post)
         if not img_url:
-            return False
+            return "no image URL"
 
-        # 1. Explicit media type (when present, anything other than "image" is out)
         media_type = post.get("media_type")
         if media_type and media_type != "image":
-            return False
+            return f"media_type is {media_type!r}"
         if not media_type and not img_url.lower().split("?")[0].endswith((".png", ".jpg", ".jpeg")):
-            return False
+            return "URL is not an image file"
 
-        # 2. Video days are mislabeled as "image": look for video wording in the visible text
+        # Video days are sometimes mislabeled "image": look for video wording in the visible text
         text = re.sub(r"<[^>]+>", " ", post.get("explanation", "") or "")
-        if VIDEO_HINTS.search(text):
-            return False
+        match = VIDEO_HINTS.search(text)
+        if match:
+            return f"explanation mentions video ({match.group(0)!r})"
 
-        # 3. Thumbnail-sized asset (dimensions are in the URL query, e.g. ?w=512&h=512)
+        # Thumbnail-sized asset (dimensions are in the URL query, e.g. ?w=512&h=512)
         try:
             q = parse_qs(urlparse(img_url).query)
             w = int(q.get("w", ["0"])[0])
             h = int(q.get("h", ["0"])[0])
             if w > 0 and h > 0 and max(w, h) < MIN_IMAGE_SIDE:
-                return False
+                return f"thumbnail-sized image ({w}x{h})"
         except (ValueError, TypeError):
             pass
 
-        return True
+        return None
 
-    def _download_image(self, post):
-        img_response = requests.get(self._get_image_url(post), timeout=20)
-        img_response.raise_for_status()
-        return Image.open(io.BytesIO(img_response.content)).convert("RGB")
+    def _is_static_image(self, post):
+        return self._static_image_reason(post) is None
+
+    def _sized_url(self, url, box):
+        """NASA's image service honors w/h, so ask for a display-sized copy
+        instead of the multi-megabyte original (avoids timeouts on slow devices)."""
+        parts = urlparse(url)
+        if "/dynamicimage/" not in parts.path:
+            return None
+        query = parse_qs(parts.query)
+        query["w"] = [str(box)]
+        query["h"] = [str(box)]
+        query.setdefault("fit", ["clip"])
+        return urlunparse(parts._replace(query=urlencode(query, doseq=True)))
+
+    def _download_image(self, post, box=None):
+        url = self._get_image_url(post)
+        attempts = []
+        if box:
+            sized = self._sized_url(url, box)
+            if sized:
+                attempts.append(sized)
+        attempts.append(url)  # original as a fallback
+
+        last_error = None
+        for attempt in attempts:
+            try:
+                resp = requests.get(attempt, timeout=(10, 60))
+                resp.raise_for_status()
+                return Image.open(io.BytesIO(resp.content)).convert("RGB")
+            except Exception as e:
+                last_error = e
+                logger.warning("Image download failed (%s): %s", attempt, e)
+        raise last_error
 
     # ---------- main entry ----------
     def generate_image(self, settings, device_config, inky_display=None):
@@ -143,26 +180,32 @@ class NasaApod(BasePlugin):
             if not posts or not isinstance(posts, list):
                 raise RuntimeError("Invalid data array returned from the NASA WordPress API.")
 
-            # Today's post first; if it isn't a static photo, try random previous days
-            candidates = [posts[0]]
+            # Today's post first; if it isn't usable, fall back to random previous days
+            reason = self._static_image_reason(posts[0])
+            if reason:
+                logger.warning("Latest post %r (%s) skipped: %s",
+                               self._get_title(posts[0]), self._get_date_text(posts[0]), reason)
             previous = [p for p in posts[1:] if self._is_static_image(p)]
             random.shuffle(previous)
-            if not self._is_static_image(posts[0]):
-                candidates = previous
-            else:
-                candidates = [posts[0]] + previous  # previous days only used if download fails
+            candidates = previous if reason else [posts[0]] + previous
+
+            # Ask NASA's image service for roughly 2x the display size, not the full original
+            box = max(1000, 2 * max(width, height))
 
             chosen_post, raw_img = None, None
             for post in candidates:
+                label = f"{self._get_title(post)!r} ({self._get_date_text(post)})"
                 try:
-                    img = self._download_image(post)
-                    if max(img.size) < MIN_IMAGE_SIDE:
-                        continue  # tiny image = video thumbnail, try another day
-                    raw_img = img
-                    chosen_post = post
-                    break
-                except Exception:
-                    continue  # bad link/corrupt file: try another day
+                    img = self._download_image(post, box)
+                except Exception as e:
+                    logger.warning("Skipping %s: download failed: %s", label, e)
+                    continue
+                if max(img.size) < MIN_IMAGE_SIDE:
+                    logger.warning("Skipping %s: image is only %dx%d", label, img.size[0], img.size[1])
+                    continue
+                raw_img, chosen_post = img, post
+                logger.info("Using %s", label)
+                break
 
             if raw_img is None:
                 return self._create_error_fallback(
@@ -276,6 +319,7 @@ class MockInkyDisplay:
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     print("Executing clean local WordPress API test run...")
     plugin = NasaApod(config={})
     try:
