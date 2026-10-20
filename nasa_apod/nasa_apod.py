@@ -11,7 +11,7 @@ from PIL import Image, ImageDraw, ImageFont
 from plugins.base_plugin.base_plugin import BasePlugin
 
 DEFAULT_SIZE = (800, 480)
-MIN_IMAGE_SIDE = 640  # smaller than this is almost certainly a video thumbnail
+MIN_IMAGE_SIDE = 640  # smaller than this should be a video thumbnail
 VIDEO_HINTS = re.compile(
     r"\b(featured video|this video|the video|video shows|time-?lapse|animation shows|watch the)\b",
     re.IGNORECASE,
