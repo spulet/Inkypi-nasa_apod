@@ -3,7 +3,7 @@ import html
 import io
 import random
 import re
-from datetime import datetime
+from datetime import date, datetime, timedelta
 import requests
 import logging
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
@@ -17,6 +17,9 @@ VIDEO_HINTS = re.compile(
     re.IGNORECASE,
 )
 logger = logging.getLogger(__name__)
+
+API_URL = "https://science.nasa.gov/wp-json/wp/v2/apod-basic"
+RANDOM_DAYS_BACK = 365   # "random from the past year"
 
 FONT_CANDIDATES = [
     "DejaVuSans-Bold.ttf",
@@ -158,30 +161,86 @@ class NasaApod(BasePlugin):
                 logger.warning("Image download failed (%s): %s", attempt, e)
         raise last_error
 
+    # ---------- fetching ----------
+    def _get_posts(self, params):
+        response = requests.get(API_URL, params=params, timeout=15)
+        response.raise_for_status()
+        posts = response.json()
+        if not isinstance(posts, list):
+            raise RuntimeError("Invalid data array returned from the NASA WordPress API.")
+        return posts
+
+    @staticmethod
+    def _post_date(post):
+        try:
+            return datetime.strptime(str(post.get("date"))[:10], "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            return None
+
+    def _random_past_year_candidates(self):
+        """Static-image posts from a random spot in the past year, shuffled.
+
+        Asks the feed for a 10-day window around a random date (WordPress
+        `after`/`before`). If the feed ignores those, falls back to a random
+        page of older posts. Returns [] if nothing usable is found."""
+        today = date.today()
+        oldest = today - timedelta(days=RANDOM_DAYS_BACK)
+        in_range = lambda p: (self._post_date(p) is not None and oldest <= self._post_date(p) < today)
+        for _ in range(3):
+            target = today - timedelta(days=random.randint(1, RANDOM_DAYS_BACK))
+            try:
+                posts = self._get_posts({"per_page": 10,
+                                         "after": f"{target - timedelta(days=10)}T00:00:00",
+                                         "before": f"{target + timedelta(days=1)}T00:00:00"})
+            except Exception as e:
+                logger.warning("Random APOD lookup around %s failed: %s", target, e)
+                continue
+            honored = posts and all(self._post_date(p) and self._post_date(p) <= target for p in posts)
+            if not honored:
+                # Feed ignored the date range: page back through older posts instead
+                page = random.randint(2, max(2, RANDOM_DAYS_BACK // 10))
+                try:
+                    posts = self._get_posts({"per_page": 10, "page": page})
+                except Exception as e:
+                    logger.warning("Random APOD page %d failed: %s", page, e)
+                    continue
+            usable = [p for p in posts if in_range(p) and self._is_static_image(p)]
+            if usable:
+                random.shuffle(usable)
+                logger.info("Random APOD: %d candidate(s) from around %s",
+                            len(usable), self._get_date_text(usable[0]))
+                return usable
+        return []
+
     # ---------- main entry ----------
     def generate_image(self, settings, device_config, inky_display=None):
         settings = settings or {}
         width, height = self._get_display_size(device_config, inky_display)
 
-        url = "https://science.nasa.gov/wp-json/wp/v2/apod-basic"
-
         try:
-            # Request a batch of recent posts so we have previous days to fall back on
-            response = requests.get(url, params={"per_page": 30}, timeout=15)
-            response.raise_for_status()
-            posts = response.json()
+            candidates = []
+            # settings["random_last_year"]: show a random picture from the past
+            # year (used by the Inky Impression's button D). Falls back to the
+            # normal behaviour if the archive can't be reached.
+            if str(settings.get("random_last_year", "")).lower() in ("true", "1", "yes", "on"):
+                candidates = self._random_past_year_candidates()
+                if not candidates:
+                    logger.warning("No random past-year APOD found; showing the latest instead.")
 
-            if not posts or not isinstance(posts, list):
-                raise RuntimeError("Invalid data array returned from the NASA WordPress API.")
+            if not candidates:
+                # Request a batch of recent posts so we have previous days to fall back on
+                posts = self._get_posts({"per_page": 30})
+                if not posts:
+                    raise RuntimeError("Invalid data array returned from the NASA WordPress API.")
 
-            # Today's post first; if it isn't usable, fall back to random previous days
-            reason = self._static_image_reason(posts[0])
-            if reason:
-                logger.warning("Latest post %r (%s) skipped: %s",
-                               self._get_title(posts[0]), self._get_date_text(posts[0]), reason)
-            previous = [p for p in posts[1:] if self._is_static_image(p)]
-            random.shuffle(previous)
-            candidates = previous if reason else [posts[0]] + previous
+                # Today's post first; if it isn't usable, fall back to random previous days
+                reason = self._static_image_reason(posts[0])
+                if reason:
+                    logger.warning("Latest post %r (%s) skipped: %s",
+                                   self._get_title(posts[0]), self._get_date_text(posts[0]), reason)
+                previous = [p for p in posts[1:] if self._is_static_image(p)]
+                random.shuffle(previous)
+                candidates = previous if reason else [posts[0]] + previous
 
             # Ask NASA's image service for roughly 2x the display size, not the full original
             box = max(1000, 2 * max(width, height))
