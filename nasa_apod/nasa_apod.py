@@ -19,6 +19,16 @@ VIDEO_HINTS = re.compile(
 logger = logging.getLogger(__name__)
 
 API_URL = "https://science.nasa.gov/wp-json/wp/v2/apod-basic"
+
+# Pixels hidden by a picture-frame mat on each edge of the display. The photo
+# still fills the whole screen, but the caption is kept inside this visible
+# area. Override per playlist instance with plugin settings topMargin /
+# bottomMargin / leftMargin / rightMargin (the same names the Style section
+# uses for other plugins), or set these to 0 for an unframed display.
+SAFE_AREA = {"top": 20, "bottom": 8, "left": 63, "right": 35}
+
+# Caption text size relative to the default banner (1.0 = original size).
+CAPTION_SCALE = 0.85
 RANDOM_DAYS_BACK = 365   # "random from the past year"
 
 FONT_CANDIDATES = [
@@ -273,7 +283,8 @@ class NasaApod(BasePlugin):
             else:
                 processed_img = self._fit_image(raw_img, width, height)
 
-            return self._overlay_text(processed_img, title, self._get_date_text(chosen_post))
+            return self._overlay_text(processed_img, title, self._get_date_text(chosen_post),
+                                      self._safe_area(settings))
 
         except Exception as e:
             raise RuntimeError(f"NASA WordPress REST API processing error: {str(e)}")
@@ -313,22 +324,41 @@ class NasaApod(BasePlugin):
         except TypeError:
             return ImageFont.load_default()
 
-    def _overlay_text(self, img, text, date_text=""):
-        """Draw a semi-transparent banner (title + date) that scales with the display."""
+    @staticmethod
+    def _safe_area(settings):
+        """Visible area insets: plugin margin settings if given, else SAFE_AREA."""
+        out = dict(SAFE_AREA)
+        for edge in out:
+            raw = (settings or {}).get(f"{edge}Margin")
+            if raw not in (None, ""):
+                try:
+                    out[edge] = max(0, int(float(raw)))
+                except (TypeError, ValueError):
+                    pass
+        return out
+
+    def _overlay_text(self, img, text, date_text="", safe=None):
+        """Draw a semi-transparent banner (title + date) that scales with the display.
+
+        The banner runs to the bottom edge, but the text sits inside the
+        visible area given by `safe` (pixels hidden by a frame on each edge)."""
+        safe = safe or {"top": 0, "bottom": 0, "left": 0, "right": 0}
         w, h = img.size
-        banner_h = max(24, int(h * 0.09))
-        font_size = max(10, int(banner_h * 0.5))
+        visible_h = max(1, h - safe["top"] - safe["bottom"])
+        band_h = max(20, int(visible_h * 0.09 * CAPTION_SCALE))   # visible part of the banner
+        font_size = max(10, int(band_h * 0.5))
         pad = max(6, int(w * 0.02))
         font = self._load_font(font_size)
+        band_top = h - safe["bottom"] - band_h
 
         base = img.convert("RGBA")
         overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
         odraw = ImageDraw.Draw(overlay)
-        odraw.rectangle([(0, h - banner_h), (w, h)], fill=(0, 0, 0, 180))
+        odraw.rectangle([(0, band_top), (w, h)], fill=(0, 0, 0, 180))
         base = Image.alpha_composite(base, overlay)
 
         draw = ImageDraw.Draw(base)
-        max_text_w = w - 2 * pad
+        max_text_w = w - safe["left"] - safe["right"] - 2 * pad
         suffix = f" - {date_text}" if date_text else ""
 
         # Truncate only the title so the date always stays visible
@@ -339,13 +369,13 @@ class NasaApod(BasePlugin):
         full_text = text + suffix
 
         text_h = font.getbbox("Ag")[3] if hasattr(font, "getbbox") else font_size
-        y = h - banner_h + (banner_h - text_h) // 2
-        draw.text((pad, y), full_text, fill=(255, 255, 255), font=font)
+        y = band_top + (band_h - text_h) // 2
+        draw.text((safe["left"] + pad, y), full_text, fill=(255, 255, 255), font=font)
         return base.convert("RGB")
 
     def _create_error_fallback(self, message, width, height):
         img = Image.new("RGB", (width, height), color=(20, 20, 30))
         draw = ImageDraw.Draw(img)
         font = self._load_font(max(12, int(height * 0.04)))
-        draw.text((int(width * 0.03), height // 2), message, fill=(255, 255, 255), font=font)
+        draw.text((SAFE_AREA["left"] + int(width * 0.03), height // 2), message, fill=(255, 255, 255), font=font)
         return img
